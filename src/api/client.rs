@@ -22,7 +22,7 @@ use crate::http::Http;
 const BASE_URL: &str = "https://api.spotify.com/v1";
 const MAX_IN_FLIGHT: usize = 6;
 const RATE_LIMIT_RETRIES: u32 = 3;
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Error)]
 pub enum ApiError {
@@ -68,6 +68,53 @@ fn is_quota_exhausted(body: &str) -> bool {
         .ok()
         .and_then(|body| body.error.reason)
         .is_some_and(|reason| reason == "QUOTA_EXCEEDED")
+}
+
+fn normalized_endpoint(path: &str) -> &str {
+    let path = path.split('?').next().unwrap_or_default();
+    match path {
+        "/me"
+        | "/me/playlists"
+        | "/me/player"
+        | "/me/player/devices"
+        | "/me/player/queue"
+        | "/me/player/recently-played"
+        | "/me/player/play"
+        | "/me/player/pause"
+        | "/me/player/next"
+        | "/me/player/previous"
+        | "/me/player/seek"
+        | "/me/player/volume"
+        | "/me/player/shuffle"
+        | "/me/player/repeat"
+        | "/me/tracks"
+        | "/me/albums"
+        | "/me/following"
+        | "/me/shows"
+        | "/me/episodes"
+        | "/me/top/tracks"
+        | "/me/top/artists"
+        | "/me/library"
+        | "/me/library/contains"
+        | "/search"
+        | "/recommendations" => path,
+        _ => match path.split('/').collect::<Vec<_>>().as_slice() {
+            ["", "playlists", _] => "/playlists/{id}",
+            ["", "playlists", _, "items"] => "/playlists/{id}/items",
+            ["", "playlists", _, "images"] => "/playlists/{id}/images",
+            ["", "artists", _] => "/artists/{id}",
+            ["", "artists", _, "albums"] => "/artists/{id}/albums",
+            ["", "artists", _, "top-tracks"] => "/artists/{id}/top-tracks",
+            ["", "artists", _, "related-artists"] => "/artists/{id}/related-artists",
+            ["", "albums", _] => "/albums/{id}",
+            ["", "albums", _, "tracks"] => "/albums/{id}/tracks",
+            ["", "shows", _] => "/shows/{id}",
+            ["", "shows", _, "episodes"] => "/shows/{id}/episodes",
+            ["", "tracks", _] => "/tracks/{id}",
+            ["", "episodes", _] => "/episodes/{id}",
+            _ => "/other",
+        },
+    }
 }
 
 /// Where bearer tokens come from.
@@ -385,12 +432,17 @@ impl ApiClient {
             .ok_or(ApiError::NotSignedIn)
     }
 
-    async fn wait_for_cooldown(&self) {
+    async fn wait_for_cooldown(&self, request_id: u64, endpoint: &str) {
         loop {
             let until = *self.cooldown_until.lock().await;
             let Some(wait) = until.checked_duration_since(Instant::now()) else {
                 return;
             };
+            log::debug!(
+                "Spotify cooldown wait source={} request_id={request_id} endpoint={endpoint} duration_ms={}",
+                self.source,
+                wait.as_millis()
+            );
             tokio::time::sleep(wait).await;
         }
     }
@@ -431,6 +483,12 @@ impl ApiClient {
         };
         let provider = self.provider()?;
         let started = Instant::now();
+        let request_id = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let endpoint = normalized_endpoint(path);
+        log::debug!(
+            "Spotify request started source={} request_id={request_id} method={method} endpoint={endpoint}",
+            self.source
+        );
         // This is one logical request even when it waits for another request
         // or for a Retry-After cooldown. Keep the interface's activity signal
         // alive for that whole wait, not only while bytes are on the wire.
@@ -441,13 +499,16 @@ impl ApiClient {
         let queue_write = method == Method::POST && path == "/me/player/queue";
         loop {
             attempt = u32::saturating_add(attempt, 1);
-            self.wait_for_cooldown().await;
+            self.wait_for_cooldown(request_id, endpoint).await;
             let permit = self
                 .limiter
                 .acquire()
                 .await
                 .map_err(|_| ApiError::NotSignedIn)?;
             let token = provider.access_token().await?;
+            // Another request may have started a cooldown while this one
+            // waited for a permit or refreshed its token.
+            self.wait_for_cooldown(request_id, endpoint).await;
             let mut request = self
                 .http
                 .client()
@@ -466,6 +527,12 @@ impl ApiClient {
             }
             let response = request.send().await?;
             let status = response.status();
+            log::debug!(
+                "Spotify response source={} request_id={request_id} method={method} endpoint={endpoint} status={} attempt={attempt} duration_ms={}",
+                self.source,
+                status.as_u16(),
+                started.elapsed().as_millis()
+            );
 
             if status == StatusCode::UNAUTHORIZED && attempt == 1 {
                 drop(permit);
@@ -479,26 +546,24 @@ impl ApiClient {
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| value.parse::<u64>().ok())
                     .map_or(Duration::from_secs(1), Duration::from_secs);
-                let text = response.text().await.unwrap_or_default();
-                if is_quota_exhausted(&text) {
-                    return Err(ApiError::QuotaExhausted);
-                }
                 // A rejected queue append is safe to retry. Keep its place
                 // in the write lock and honor the full server-requested wait.
                 // Other requests retain their existing bounded retry policy.
-                let wait = if queue_write {
-                    wait
-                } else {
-                    wait.min(MAX_RETRY_AFTER)
-                };
-                log::warn!("Spotify rate limit source={} wait={wait:?}", self.source);
+                self.extend_cooldown(wait).await;
+                log::warn!(
+                    "Spotify rate limit source={} request_id={request_id} method={method} endpoint={endpoint} status=429 attempt={attempt} wait={wait:?}",
+                    self.source
+                );
                 log::info!(
                     "Spotify cooldown source={} duration_ms={}",
                     self.source,
                     wait.as_millis()
                 );
                 drop(permit);
-                self.extend_cooldown(wait).await;
+                let text = response.text().await.unwrap_or_default();
+                if is_quota_exhausted(&text) {
+                    return Err(ApiError::QuotaExhausted);
+                }
                 if !queue_write && attempt > RATE_LIMIT_RETRIES {
                     return Err(ApiError::RateLimited);
                 }
@@ -510,13 +575,6 @@ impl ApiClient {
                 continue;
             }
             let text = response.text().await?;
-            log::debug!(
-                "Spotify request source={} method={} status={} duration_ms={}",
-                self.source,
-                method,
-                status.as_u16(),
-                started.elapsed().as_millis()
-            );
             if status.is_success() {
                 return Ok(text);
             }
@@ -1174,6 +1232,196 @@ impl ApiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn playlist_test_client(address: std::net::SocketAddr) -> ApiClient {
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut client = ApiClient::new(
+            http.clone(),
+            Arc::new(NetActivity::default()),
+            20,
+            50,
+            ApiSource::Shared,
+        );
+        client.base_url = Some(format!("http://{address}"));
+        let root = std::env::temp_dir().join("unused-playlist-test-token");
+        let store = crate::credentials::Store::in_memory(crate::paths::AppDirs {
+            config: root.join("config"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+        });
+        client.set_token_provider(Some(TokenProvider::Web(WebTokens::new(
+            http,
+            crate::auth::StoredToken {
+                access_token: "test-only".into(),
+                expires_at: u64::MAX,
+                ..Default::default()
+            },
+            store.lease(crate::credentials::Slot::Shared),
+            ApiSource::Shared,
+            Arc::new(|_| {}),
+        ))));
+        client
+    }
+
+    async fn playlist_response(
+        listener: &tokio::net::TcpListener,
+        status: &str,
+        wait: u64,
+        body: &str,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(socket.read_u8().await.unwrap());
+            assert!(request.len() < 8192);
+        }
+        assert!(
+            String::from_utf8(request)
+                .unwrap()
+                .starts_with("GET /me/playlists?limit=50&offset=0 HTTP/1.1")
+        );
+        socket.write_all(format!(
+            "HTTP/1.1 {status}\r\nRetry-After: {wait}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+        ).as_bytes()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn playlist_rate_limit_is_bounded_and_keeps_the_full_retry_after() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = playlist_test_client(listener.local_addr().unwrap());
+        let server = async {
+            for attempt in 0..=RATE_LIMIT_RETRIES {
+                let wait = if attempt == RATE_LIMIT_RETRIES {
+                    120
+                } else {
+                    0
+                };
+                playlist_response(&listener, "429 Too Many Requests", wait, "").await;
+            }
+        };
+        let (result, ()) = tokio::join!(client.my_playlists(0, 50), server);
+        assert!(matches!(result, Err(ApiError::RateLimited)));
+        assert!(
+            client
+                .cooldown_until
+                .lock()
+                .await
+                .duration_since(Instant::now())
+                > Duration::from_secs(110)
+        );
+        let retry = client.my_playlists(0, 50);
+        tokio::pin!(retry);
+        tokio::select! {
+            result = &mut retry => panic!("retry must wait: {result:?}"),
+            result = tokio::time::timeout(Duration::from_millis(30), listener.accept()) => {
+                assert!(result.is_err(), "no HTTP request during cooldown");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn playlist_request_rechecks_cooldown_after_waiting_for_a_permit() {
+        use std::future::Future;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = playlist_test_client(listener.local_addr().unwrap());
+        let permits = client
+            .limiter
+            .acquire_many(MAX_IN_FLIGHT as u32)
+            .await
+            .unwrap();
+        let request = client.my_playlists(0, 50);
+        tokio::pin!(request);
+        std::future::poll_fn(|cx| {
+            assert!(request.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let started = Instant::now();
+        client.extend_cooldown(Duration::from_secs(1)).await;
+        drop(permits);
+        let server = async {
+            playlist_response(
+                &listener,
+                "200 OK",
+                0,
+                r#"{"items":[],"total":0,"limit":50,"offset":0,"next":null}"#,
+            )
+            .await;
+            assert!(started.elapsed() >= Duration::from_secs(1));
+        };
+        let (result, ()) = tokio::join!(request, server);
+        assert!(result.unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn playlist_retry_recovers_after_cooldown() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = playlist_test_client(listener.local_addr().unwrap());
+        let server = async {
+            for attempt in 0..=RATE_LIMIT_RETRIES {
+                playlist_response(
+                    &listener,
+                    "429 Too Many Requests",
+                    u64::from(attempt == RATE_LIMIT_RETRIES),
+                    "",
+                )
+                .await;
+            }
+            let started = Instant::now();
+            playlist_response(&listener, "200 OK", 0, r#"{"items":[{"id":"recovered","name":"Recovered"}],"total":1,"limit":50,"offset":0,"next":null}"#).await;
+            assert!(started.elapsed() >= Duration::from_secs(1));
+        };
+        let requests = async {
+            assert!(matches!(
+                client.my_playlists(0, 50).await,
+                Err(ApiError::RateLimited)
+            ));
+            let page = client.my_playlists(0, 50).await.unwrap();
+            assert_eq!(page.items[0].id, "recovered");
+        };
+        tokio::join!(requests, server);
+    }
+
+    #[tokio::test]
+    async fn playlist_quota_exhaustion_stops_and_preserves_retry_after() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = playlist_test_client(listener.local_addr().unwrap());
+        let (result, ()) = tokio::join!(
+            client.my_playlists(0, 50),
+            playlist_response(
+                &listener,
+                "429 Too Many Requests",
+                120,
+                r#"{"error":{"status":429,"reason":"QUOTA_EXCEEDED"}}"#
+            )
+        );
+        assert!(matches!(result, Err(ApiError::QuotaExhausted)));
+        assert!(
+            client
+                .cooldown_until
+                .lock()
+                .await
+                .duration_since(Instant::now())
+                > Duration::from_secs(110)
+        );
+    }
+
+    #[test]
+    fn diagnostic_endpoints_do_not_include_private_values() {
+        for (path, expected) in [
+            ("/me/playlists?offset=50", "/me/playlists"),
+            ("/search?q=private", "/search"),
+            ("/playlists/private-id/items", "/playlists/{id}/items"),
+            ("/users/private-user/playlists", "/other"),
+            ("https://example.com/private?token=secret", "/other"),
+        ] {
+            assert_eq!(normalized_endpoint(path), expected);
+        }
+    }
 
     #[tokio::test]
     async fn revoked_provider_cannot_return_or_persist_its_token() {

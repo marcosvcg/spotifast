@@ -184,6 +184,22 @@ rows are placeholders until their page arrives; scrolling never starts playback.
 
 ## When Spotify pushes back
 
+The Playlists shelf offers a **Retry** icon after a failed library request.
+It resumes the failed page, keeping playlists already shown. While the retry
+is pending, the shelf shows its loading indicator and accepts no second retry.
+An active shared-session cooldown is waited out before sending the request,
+including the full `Retry-After` interval. A failed page stops automatic paging
+until another manual retry. This restores recovery after a temporary failure;
+it cannot restore the shared app's quota or switch the list to a personal app.
+
+To diagnose library loading, enable verbose logging (`--verbose`). Web API
+logs identify each request by a process-local number, method, credential source,
+and endpoint template, without IDs, query values, headers or bodies. They
+distinguish received HTTP statuses from waiting for a session cooldown. Gateway
+logs also show requests waiting for sign-in verification, before any library
+HTTP request can be sent. Playlist-library logs include page offsets and load
+generations. Rate-limit warnings include the endpoint even without verbose logging.
+
 Each Web API session has separate concurrency and rate limits. A `Retry-After`
 response pauses only that session. Spotifast routes each request once and
 does not retry it through the other app. A playlist read the librespot session

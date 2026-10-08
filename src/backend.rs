@@ -3459,6 +3459,9 @@ async fn handle(
     request: ApiRequest,
 ) -> (ApiResponse, Option<ApiSource>) {
     let operation = operation_for(api, &request);
+    if let ApiRequest::MyPlaylists { offset, generation } = &request {
+        log::debug!("Spotify playlist library started offset={offset} generation={generation}");
+    }
     // A session whose long-lived connection has dropped still answers over
     // its HTTP client, so the engine's presence is the only liveness test;
     // a read the session truly cannot make falls back to the Web API below.
@@ -3539,11 +3542,18 @@ async fn handle(
                 result,
             }
         }
-        ApiRequest::MyPlaylists { offset, generation } => ApiResponse::MyPlaylists {
-            offset,
-            generation,
-            result: routed!(my_playlists(offset, 50)),
-        },
+        ApiRequest::MyPlaylists { offset, generation } => {
+            let result = routed!(my_playlists(offset, 50));
+            log::debug!(
+                "Spotify playlist library finished offset={offset} generation={generation} success={}",
+                result.is_ok()
+            );
+            ApiResponse::MyPlaylists {
+                offset,
+                generation,
+                result,
+            }
+        }
         ApiRequest::Playlist { id, generation } => ApiResponse::Playlist {
             result: routed!(playlist(&id)),
             id,

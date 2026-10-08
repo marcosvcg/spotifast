@@ -757,6 +757,17 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
     }
     for surface in show.unwrap_or("").split(',').map(str::trim) {
         match surface {
+            "library-playlists-error" => {
+                app.library.playlists =
+                    Loadable::Failed(crate::api::ApiError::RateLimited.to_string());
+            }
+            "library-playlists-loading" => app.library.playlists = Loadable::Loading,
+            "library-playlists-empty" => app.library.playlists = Loadable::Loaded(Vec::new()),
+            "library-playlists-partial" => {
+                app.library.playlists.get_mut().unwrap().truncate(2);
+                app.library.playlists_next = Some(2);
+                app.library.playlists_error = Some(crate::api::ApiError::RateLimited.to_string());
+            }
             "library-list"
             | "library-list-narrow"
             | "library-list-wide"
@@ -1257,6 +1268,70 @@ mod tests {
         // These frames never advance the clock or take pictures.
         app.reveal_theme_changes = false;
         (ctx, app)
+    }
+
+    #[test]
+    fn playlist_library_retry_is_accessible_and_keeps_partial_rows() {
+        use egui::accesskit::{Action as AccessibleAction, Role};
+        for partial in [false, true] {
+            for width in [230.0, 380.0] {
+                let (ctx, mut app) = accessible_app("playlist-library-retry");
+                app.settings.sidebar_width = width;
+                let message = crate::api::ApiError::RateLimited.to_string();
+                if partial {
+                    app.library.playlists_error = Some(message);
+                    app.library.playlists_next = Some(50);
+                } else {
+                    app.library.playlists = Loadable::Failed(message);
+                }
+                let before = app.library.playlists.get().cloned();
+                accessible_frame(&ctx, &mut app, vec![]);
+                let tree = accessible_frame(&ctx, &mut app, vec![]);
+                let retry = accessible_node(&tree, "Retry", Role::Button);
+                accessible_frame(
+                    &ctx,
+                    &mut app,
+                    vec![accessible_action(retry, AccessibleAction::Click, None)],
+                );
+                if partial {
+                    assert_eq!(app.library.playlists.get(), before.as_ref());
+                    assert_eq!(app.library.playlists_asked, Some(50));
+                    assert!(app.library.playlists_error.is_none());
+                } else {
+                    assert!(app.library.playlists.is_loading());
+                }
+                let tree = accessible_frame(&ctx, &mut app, vec![]);
+                let retry = accessible_node(&tree, "Retry", Role::Button);
+                assert!(
+                    tree.nodes
+                        .iter()
+                        .find(|(id, _)| *id == retry)
+                        .unwrap()
+                        .1
+                        .is_disabled()
+                );
+                app.backend.shutdown();
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_playlist_library_has_no_error_or_retry() {
+        use egui::accesskit::Role;
+        let (ctx, mut app) = accessible_app("playlist-library-empty");
+        app.library.playlists = Loadable::Loaded(Vec::new());
+        accessible_frame(&ctx, &mut app, vec![]);
+        let tree = accessible_frame(&ctx, &mut app, vec![]);
+        assert!(
+            !tree
+                .nodes
+                .iter()
+                .any(|(_, node)| { node.role() == Role::Button && node.label() == Some("Retry") })
+        );
+        let painted = view_frame(&ctx, &mut app, vec![], crate::ui::sidebar::show);
+        assert!(painted.iter().any(|(text, _)| text == "Liked Songs"));
+        assert!(!painted.iter().any(|(text, _)| text == "Loading…"));
+        app.backend.shutdown();
     }
 
     /// #576: the Library heading never runs under the header's buttons. It

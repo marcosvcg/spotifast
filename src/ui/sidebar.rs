@@ -1027,11 +1027,13 @@ fn contents(app: &mut App, ui: &mut egui::Ui, grid_art: Option<Rect>) {
     let needle = app.library.filter.trim().to_lowercase();
     let user_id = app.user_id().unwrap_or("").to_string();
     let mut entries: Vec<Entry> = Vec::new();
-    let mut loading = false;
-    let mut error: Option<String> = None;
+    let mut loading;
+    let mut error: Option<String>;
     let mut more_page: Option<Page> = None;
     match filter {
         Filter::Playlists => {
+            loading = app.library.playlists_asked.is_some();
+            error = app.library.playlists_error.clone();
             let liked = liked_entry(app);
             if needle.is_empty() || liked.name.to_lowercase().contains(&needle) {
                 entries.push(liked);
@@ -1193,11 +1195,36 @@ fn contents(app: &mut App, ui: &mut egui::Ui, grid_art: Option<Rect>) {
             {
                 super::widgets::scroll_during_drag(ui);
             }
-            if loading {
-                super::widgets::loading_row(ui, &palette, app.locale);
-            }
-            if let Some(error) = &error {
-                super::widgets::error_row(ui, app, error, None);
+            if filter == Filter::Playlists && (loading || error.is_some()) {
+                ui.horizontal(|ui| {
+                    let retry = ui.add_enabled_ui(!loading, |ui| {
+                        theme::icon_button(
+                            ui,
+                            Icon::Refresh,
+                            16.0,
+                            palette.secondary,
+                            palette.text,
+                            &gettext(locale, "Retry"),
+                        )
+                    });
+                    if retry.inner.clicked() {
+                        app.actions.push(Action::RetryPlaylists);
+                    }
+                    if loading {
+                        super::widgets::loading_row(ui, &palette, app.locale);
+                    } else if let Some(error) = &error {
+                        ui.scope(|ui| super::widgets::error_row(ui, app, error, None))
+                            .response
+                            .on_hover_text(error);
+                    }
+                });
+            } else {
+                if loading {
+                    super::widgets::loading_row(ui, &palette, app.locale);
+                }
+                if let Some(error) = &error {
+                    super::widgets::error_row(ui, app, error, None);
+                }
             }
             if entries.is_empty() && !loading && error.is_none() {
                 ui.add_space(12.0);

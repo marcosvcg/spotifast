@@ -289,6 +289,9 @@ impl ApiGateway {
                 // A personal grant can open the app before the shared grant
                 // finishes verification. Keep shared-only views loading.
                 SessionState::Authorizing => {
+                    log::debug!(
+                        "Spotify route waiting operation={operation:?} source={source} reason=authorization"
+                    );
                     state.changed().await.map_err(|_| ApiError::NotSignedIn)?;
                 }
             }
